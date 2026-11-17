@@ -1,0 +1,2 @@
+space,metric,dim,n,n_train,n_bins,eta,k,num_samples,knn_consistency_mean,knn_consistency_std,knn_consistency_p50,knn_consistency_p90,perfect_consistency,zero_consistency,bucket_min,bucket_max,bucket_mean,bucket_std,bucket_imbalance,empty_buckets
+laion_eta100,ip,768,102144212,1000000,10000,100.0,10,10000,0.4212,0.3652,0.3,1.0,0.1462,0.2196,0,165026,10214.4,4223.8,16.156,116

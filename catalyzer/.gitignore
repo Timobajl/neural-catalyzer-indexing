@@ -1,0 +1,8 @@
+*.pyc
+*.cxx
+*.o
+ckpt.zip
+ckpts
+data
+*.csv
+test_ckpt

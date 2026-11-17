@@ -1,0 +1,1492 @@
+diff --git a/.gitignore b/.gitignore
+index edc5671..8dad2e9 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -1,3 +1,8 @@
+ *.pyc
+ *.cxx
+ *.o
++ckpt.zip
++ckpts
++data
++*.csv
++test_ckpt
+\ No newline at end of file
+diff --git a/eval.py b/eval.py
+index 013202f..3ba737e 100644
+--- a/eval.py
++++ b/eval.py
+@@ -40,14 +40,15 @@ if __name__ == "__main__":
+     if args.device == "auto":
+         args.device = "cuda" if torch.cuda.is_available() else "cpu"
+ 
+-    start = time.time()
+     if os.path.exists(args.ckpt_path):
+         print("Loading net")
+-        ckpt = torch.load(args.ckpt_path)
++        ckpt = torch.load(args.ckpt_path, map_location=torch.device('cpu'), weights_only=False)
+         d = vars(args)
+         for k, v in vars(ckpt['args']).items():
+             d[k] = v
+ 
++        # The checkpoints store device cuda, and reproduce.sh runs on CPU-only nodes
++        args.device = 'cpu'
+         (xt, xb, xq, gt) = load_dataset(args.database, args.device, size=args.size_base, test=args.test)
+         dim = xb.shape[1]
+         dint, dout = args.dint, args.dout
+@@ -89,4 +90,7 @@ if __name__ == "__main__":
+         print("Main argument not understood: should be the path to a net checkpoint")
+         import sys;sys.exit(1)
+ 
++    start = time.time()
+     evaluate(net, xq, xb, gt, [args.quantizer], '%s,rank=%d' % (args.quantizer, 10), device=args.device, trainset=xt[:10000])
++    end = time.time()
++    print("Encoding + evaluation time: %.2f seconds" % (end - start))
+diff --git a/export_scripts/export_run.sh b/export_scripts/export_run.sh
+new file mode 100644
+index 0000000..87dac8a
+--- /dev/null
++++ b/export_scripts/export_run.sh
+@@ -0,0 +1,139 @@
++#!/bin/bash
++#PBS -l select=1:ncpus=8:mem=12gb:scratch_local=20gb:cluster=galdor
++#PBS -l walltime=01:00:00
++# Usage: qsub export_scripts/export_run.sh
++
++set -euo pipefail
++
++DATABASE="bigann"
++# Pairs used in the thesis are active. The others complete the lambda sweep.
++PAIRS=(
++    # --- 16D ---
++    # "16 0.05"
++    # "16 0.02"
++    "16 0.01"
++    # "16 0.005"
++    # "16 0.001"
++    # "16 0.0005"
++    # "16 0.0001"
++    # "16 0.00005"
++    # --- 32D ---
++    # "32 0.01"
++    # "32 0.005"
++    # "32 0.001"
++    "32 0.0007"
++    # "32 0.0005"
++    # "32 0.0001"
++    # "32 0.00005"
++    # "32 0.00001"
++    # "32 0.000005"
++    # --- 64D ---
++    # "64 0.01"
++    # "64 0.005"
++    # "64 0.001"
++    # "64 0.0005"
++    "64 0.0002"
++    # "64 0.0001"
++    # "64 0.00008"
++    # "64 0.00005"
++    # "64 0.00001"
++    # "64 0.000005"
++    # --- 128D ---
++    # "128 0.01"
++    # "128 0.005"
++    # "128 0.001"
++    # "128 0.0005"
++    # "128 0.0002"
++    "128 0.0001"
++    # "128 0.00008"
++    # "128 0.00005"
++    # "128 0.00001"
++    # "128 0.000005"
++)
++
++CKPT_BASE="checkpoints"
++
++BIGANN_DIR="/storage/brno2/home/martykant/datasets/bigann"
++REPO_DIR="${REPO_DIR:-/storage/brno2/home/martykant/neural-catalyzer-indexing}"
++SCRIPT_DIR="$REPO_DIR/catalyzer"
++DEVICE="auto"
++OUTPUT_DIR=${OUTPUT_DIR:-"/storage/brno2/home/martykant/data"}
++
++export OMP_NUM_THREADS=$PBS_NUM_PPN
++export MKL_NUM_THREADS=$PBS_NUM_PPN
++
++mkdir -p "$OUTPUT_DIR/$DATABASE"
++
++MASTER_LOG="$OUTPUT_DIR/${DATABASE}_master_setup.log"
++echo "Logging setup output to $MASTER_LOG"
++exec >> "$MASTER_LOG" 2>&1
++
++echo "====================================================="
++echo "Job start: $(date)"
++echo "Host: $(hostname)"
++echo "====================================================="
++
++module add mambaforge
++
++BYTES=264000000  # first 2 M vectors (132 B each)
++export BIGANN_PATH="$SCRATCHDIR"
++
++echo "copying bigann query to scratch"
++cp $BIGANN_DIR/bigann_query.bvecs $SCRATCHDIR/
++
++echo "copying gnd to scratch"
++mkdir -p $SCRATCHDIR/gnd
++cp $BIGANN_DIR/gnd/*.ivecs $SCRATCHDIR/gnd/
++
++echo "copying learn to scratch"
++head -c $BYTES $BIGANN_DIR/bigann_learn.bvecs > $SCRATCHDIR/bigann_learn.bvecs
++
++echo "copying base to scratch"
++head -c $BYTES $BIGANN_DIR/bigann_base.bvecs > $SCRATCHDIR/bigann_base.bvecs
++
++
++mamba activate /storage/brno2/home/martykant/conda_envs/bc
++cd $SCRIPT_DIR
++
++for pair in "${PAIRS[@]}"; do
++    read -r dout lam <<< "$pair"
++
++    ckpt="${CKPT_BASE}/${DATABASE}${dout}/${lam}/checkpoint.pth.best"
++    TRANSFORMED_DIR="$SCRATCHDIR/$DATABASE/catalyzer_d${dout}_l${lam}"
++    DEST_DIR="$OUTPUT_DIR/$DATABASE/catalyzer_d${dout}_l${lam}"
++
++    echo ""
++    echo "===================================================================="
++    echo "  Dataset : $DATABASE   Dim : ${dout}D   Lambda : $lam"
++    echo "  Ckpt    : $ckpt"
++    echo "===================================================================="
++
++    start=$(date +%s)
++
++    /usr/bin/time -v python -u export_vectors.py \
++        --ckpt-path  "$ckpt" \
++        --database   "$DATABASE" \
++        --device     "$DEVICE" \
++        --output-dir "$SCRATCHDIR"
++
++    end=$(date +%s)
++    runtime=$((end - start))
++    echo "Run time: $runtime seconds."
++
++    echo "Copying exported data to $DEST_DIR ..."
++    mkdir -p "$DEST_DIR"
++    cp -a "$TRANSFORMED_DIR/." "$DEST_DIR/"
++    echo "Data copied."
++
++    rm -rf "$TRANSFORMED_DIR"
++done
++
++if [ -d "$SCRATCHDIR/$DATABASE/original/" ]; then
++    mkdir -p "$OUTPUT_DIR/$DATABASE/original"
++    cp -a "$SCRATCHDIR/$DATABASE/original/." "$OUTPUT_DIR/$DATABASE/original/"
++    echo "Original data copied."
++fi
++
++echo "Export completed."
++
++clean_scratch
+diff --git a/export_scripts/export_run_deep.sh b/export_scripts/export_run_deep.sh
+new file mode 100644
+index 0000000..6beb51c
+--- /dev/null
++++ b/export_scripts/export_run_deep.sh
+@@ -0,0 +1,129 @@
++#!/bin/bash
++#PBS -l select=1:ncpus=8:mem=20gb:scratch_local=20gb:cluster=galdor
++#PBS -l walltime=04:00:00
++# Usage: qsub export_scripts/export_run_deep.sh
++
++set -euo pipefail
++
++DATABASE="deep1b"
++
++# Pairs used in the thesis are active. The others complete the lambda sweep.
++PAIRS=(
++    # --- 16D ---
++    # "16 0.05"
++    "16 0.02"
++    # "16 0.01"
++    # "16 0.005"
++    # "16 0.001"
++
++    # --- 32D ---
++    "32 0.005"
++    # "32 0.001"
++    # "32 0.0007"
++    # "32 0.0005"
++    # "32 0.0001"
++    # "32 0.008"
++    # "32 0.01"
++    # "32 0.02"
++
++    # --- 64D ---
++    # "64 0.001"
++    # "64 0.0005"
++    "64 0.0002"
++    # "64 0.0001"
++    # "64 0.00005"
++
++    # --- 96D ---
++    # "96 0.01"
++    # "96 0.001"
++    # "96 0.0005"
++    "96 0.0002"
++    # "96 0.00015"
++    # "96 0.0001"
++    # "96 0.00005"
++)
++
++CKPT_BASE="checkpoints"
++DEEP1B_DIR="/storage/brno2/home/martykant/datasets/deep1b"
++REPO_DIR="${REPO_DIR:-/storage/brno2/home/martykant/neural-catalyzer-indexing}"
++SCRIPT_DIR="$REPO_DIR/catalyzer"
++DEVICE="auto"
++OUTPUT_DIR=${OUTPUT_DIR:-"/storage/brno2/home/martykant/data"}
++
++export OMP_NUM_THREADS=$PBS_NUM_PPN
++export MKL_NUM_THREADS=$PBS_NUM_PPN
++
++mkdir -p "$OUTPUT_DIR/$DATABASE"
++
++MASTER_LOG="$OUTPUT_DIR/${DATABASE}_master_setup.log"
++echo "Logging setup output to $MASTER_LOG"
++exec >> "$MASTER_LOG" 2>&1
++
++echo "====================================================="
++echo "Job start: $(date)"
++echo "Host: $(hostname)"
++echo "====================================================="
++
++module add mambaforge
++
++BYTES=3840000008  # 8 B header + first 10 M vectors (384 B each)
++export DEEP1B_PATH="$SCRATCHDIR"
++
++echo "Starting data copy to SCRATCHDIR..."
++COPY_START=$(date +%s)
++
++cp $DEEP1B_DIR/query.public.10K.fbin $SCRATCHDIR/
++cp $DEEP1B_DIR/deep_new_groundtruth.public.10K.bin $SCRATCHDIR/
++
++echo "Copying first $BYTES bytes (~10M vectors) from learn and base files..."
++head -c $BYTES $DEEP1B_DIR/learn.350M.fbin > $SCRATCHDIR/learn.350M.fbin
++head -c $BYTES $DEEP1B_DIR/base.1B.fbin > $SCRATCHDIR/base.1B.fbin
++
++COPY_END=$(date +%s)
++COPY_TIME=$((COPY_END - COPY_START))
++echo "Data copying finished in $COPY_TIME seconds."
++
++mamba activate /storage/brno2/home/martykant/conda_envs/bc
++cd $SCRIPT_DIR
++
++for pair in "${PAIRS[@]}"; do
++    read -r dout lam <<< "$pair"
++
++    ckpt="${CKPT_BASE}/${DATABASE}${dout}/${lam}/checkpoint.pth.best"
++    TRANSFORMED_DIR="$SCRATCHDIR/$DATABASE/catalyzer_d${dout}_l${lam}"
++    DEST_DIR="$OUTPUT_DIR/$DATABASE/catalyzer_d${dout}_l${lam}"
++
++    echo ""
++    echo "===================================================================="
++    echo "  Dataset : $DATABASE   Dim : ${dout}D   Lambda : $lam"
++    echo "  Ckpt    : $ckpt"
++    echo "===================================================================="
++
++    start=$(date +%s)
++
++    /usr/bin/time -v python -u export_vectors.py \
++        --ckpt-path  "$ckpt" \
++        --database   "$DATABASE" \
++        --device     "$DEVICE" \
++        --output-dir "$SCRATCHDIR"
++
++    end=$(date +%s)
++    runtime=$((end - start))
++    echo "Run time: $runtime seconds."
++
++    echo "Copying exported data to $DEST_DIR ..."
++    mkdir -p "$DEST_DIR"
++    cp -a "$TRANSFORMED_DIR/." "$DEST_DIR/"
++    echo "Data copied."
++
++    rm -rf "$TRANSFORMED_DIR"
++done
++
++if [ -d "$SCRATCHDIR/$DATABASE/original/" ]; then
++    mkdir -p "$OUTPUT_DIR/$DATABASE/original"
++    cp -a "$SCRATCHDIR/$DATABASE/original/." "$OUTPUT_DIR/$DATABASE/original/"
++    echo "Original data copied."
++fi
++
++echo "Export completed."
++clean_scratch
+\ No newline at end of file
+diff --git a/export_scripts/export_run_laion.sh b/export_scripts/export_run_laion.sh
+new file mode 100644
+index 0000000..c161790
+--- /dev/null
++++ b/export_scripts/export_run_laion.sh
+@@ -0,0 +1,133 @@
++#!/bin/bash
++#PBS -l select=1:ncpus=10:mem=38gb:scratch_ssd=370gb
++#PBS -l walltime=10:00:00
++# Usage: qsub export_scripts/export_run_laion.sh
++
++set -euo pipefail
++
++DATABASE="laion"
++
++
++# Pairs used in the thesis are active. The others complete the lambda sweep.
++# The full sweep of 29 pairs takes about 12 h, so raise the walltime to 24 h for it.
++PAIRS=(
++    # --- 16D ---
++    # "16 0.05"
++    # "16 0.02"
++    # "16 0.01"
++    # "16 0.08"
++    "16 0.1"
++    # "16 0.2"
++
++    # --- 32D ---
++    # "32 0.005"
++    "32 0.001"
++    # "32 0.0007"
++    # "32 0.0005"
++
++    # --- 64D ---
++    # "64 0.001"
++    # "64 0.0005"
++    "64 0.0002"
++    # "64 0.0001"
++
++    # --- 128D ---
++    # "128 0.01"
++    # "128 0.0005"
++    # "128 0.0002"
++    # "128 0.0001"
++    # "128 0.00008"
++    "128 0.001"
++    # "128 0.005"
++
++    # --- 768D ---
++    "768 0.0005"
++    # "768 0.0001"
++    # "768 0.00005"
++    # "768 0.00001"
++    # "768 0.000005"
++    # "768 0.001"
++    # "768 0.002"
++    # "768 0.005"
++)
++
++REPO_DIR="${REPO_DIR:-/storage/brno2/home/martykant/neural-catalyzer-indexing}"
++CKPT_BASE="$REPO_DIR/catalyzer/checkpoints"
++LAION_DIR="/storage/brno2/home/martykant/datasets/laion"
++SCRIPT_DIR="$REPO_DIR/catalyzer"
++DEVICE="auto"
++OUTPUT_DIR=${OUTPUT_DIR:-"/storage/brno2/home/martykant/data"}
++
++export OMP_NUM_THREADS=$PBS_NUM_PPN
++export MKL_NUM_THREADS=$PBS_NUM_PPN
++
++mkdir -p "$OUTPUT_DIR/$DATABASE"
++
++MASTER_LOG="$OUTPUT_DIR/${DATABASE}_master_setup.log"
++echo "Logging setup output to $MASTER_LOG"
++exec >> "$MASTER_LOG" 2>&1
++
++echo "====================================================="
++echo "Job start: $(date)"
++echo "Host: $(hostname)"
++echo "====================================================="
++
++module add mambaforge
++
++export LAION_PATH="$SCRATCHDIR"
++
++echo "Starting data copy to SCRATCHDIR..."
++COPY_START=$(date +%s)
++
++cp $LAION_DIR/laion2B-en-clip768v2-n=100M.h5 $SCRATCHDIR/
++cp $LAION_DIR/public-queries-2024-laion2B-en-clip768v2-n=10k.h5 $SCRATCHDIR/
++cp $LAION_DIR/gold-standard-dbsize=100M--public-queries-2024-laion2B-en-clip768v2-n=10k.h5 $SCRATCHDIR/
++
++COPY_END=$(date +%s)
++COPY_TIME=$((COPY_END - COPY_START))
++echo "Data copying finished in $COPY_TIME seconds."
++
++mamba activate /storage/brno2/home/martykant/conda_envs/bc
++cd $SCRIPT_DIR
++
++for pair in "${PAIRS[@]}"; do
++    read -r dout lam <<< "$pair"
++
++    ckpt="${CKPT_BASE}/${DATABASE}${dout}/${lam}/checkpoint.pth.best"
++    TRANSFORMED_DIR="$SCRATCHDIR/$DATABASE/catalyzer_d${dout}_l${lam}"
++    DEST_DIR="$OUTPUT_DIR/$DATABASE/catalyzer_d${dout}_l${lam}"
++
++    echo ""
++    echo "===================================================================="
++    echo "  Dataset : $DATABASE   Dim : ${dout}D   Lambda : $lam"
++    echo "  Ckpt    : $ckpt"
++    echo "===================================================================="
++
++    start=$(date +%s)
++
++    /usr/bin/time -v python -u export_vectors.py \
++        --ckpt-path  "$ckpt" \
++        --database   "$DATABASE" \
++        --device     "$DEVICE" \
++        --output-dir "$SCRATCHDIR"
++
++    end=$(date +%s)
++    runtime=$((end - start))
++    echo "Run time: $runtime seconds."
++
++    echo "Copying exported data to $DEST_DIR ..."
++    mkdir -p "$DEST_DIR"
++    cp -a "$TRANSFORMED_DIR/." "$DEST_DIR/"
++    echo "Data copied."
++
++    rm -rf "$TRANSFORMED_DIR"
++done
++
++if [ -d "$SCRATCHDIR/$DATABASE/original/" ]; then
++    mkdir -p "$OUTPUT_DIR/$DATABASE/original"
++    cp -a "$SCRATCHDIR/$DATABASE/original/." "$OUTPUT_DIR/$DATABASE/original/"
++    echo "Original data copied."
++fi
++
++echo "Export completed."
++clean_scratch
+diff --git a/export_vectors.py b/export_vectors.py
+new file mode 100644
+index 0000000..3825345
+--- /dev/null
++++ b/export_vectors.py
+@@ -0,0 +1,282 @@
++"""
++Export original and catalyzer-transformed vectors for the index experiments.
++
++Loads a trained catalyzer checkpoint and the dataset in test mode and writes
++  <output-dir>/<db>/original/                      xb.npy, xq.npy, gt.npy, xt.npy
++  <output-dir>/<db>/catalyzer_d<dout>_l<lambda>/   xbt.npy, xqt.npy
++The original vectors are shared by all catalyzer variants and are written
++only once.
++"""
++import argparse
++import os
++from decimal import Decimal
++
++import numpy as np
++import torch
++import torch.nn as nn
++
++from lib.data import load_dataset, LaionLazyLoader
++from lib.net import Normalize, forward_pass
++
++
++def base_shape(xb) -> tuple[int, int]:
++    return tuple(int(v) for v in xb.shape)
++
++
++def validate_loaded_dataset(db: str, xb, xq: np.ndarray, gt: np.ndarray) -> None:
++    n_base, dim_base = base_shape(xb)
++    print(f"  loaded xb shape=({n_base:,}, {dim_base})")
++    print(f"  loaded xq shape={xq.shape}")
++    print(f"  loaded gt shape={gt.shape}  min={int(gt.min())}  max={int(gt.max())}")
++
++    if xq.shape[1] != dim_base:
++        raise ValueError(f"xq dimension {xq.shape[1]} does not match xb dimension {dim_base}")
++    if gt.min() < 0:
++        raise ValueError("Ground truth must be 0-based for FAISS, but contains negative IDs.")
++    if gt.max() >= n_base:
++        raise ValueError(
++            f"Ground truth max ID {int(gt.max())} is outside xb length {n_base}."
++        )
++    if db == "laion":
++        print("  LAION GT validated as 0-based and within exported base-vector range.")
++
++
++def validate_existing_array(path: str, expected: np.ndarray, name: str) -> None:
++    existing = np.load(path, mmap_mode='r')
++    if existing.shape != expected.shape:
++        raise ValueError(
++            f"Existing {name} at {path} has shape {existing.shape}, expected {expected.shape}."
++        )
++    if existing.dtype != expected.dtype:
++        raise ValueError(
++            f"Existing {name} at {path} has dtype {existing.dtype}, expected {expected.dtype}."
++        )
++    if not np.array_equal(np.asarray(existing), expected):
++        raise ValueError(
++            f"Existing {name} at {path} differs from freshly loaded data."
++        )
++
++
++def save_chunked_original(xb_lazy: LaionLazyLoader, out_path: str) -> None:
++    """
++    Saves the original float16 vectors from the lazy loader directly to a
++    float16 .npy file.  No float32 cast — the source dtype is kept to
++    halve disk usage (about 157 GB instead of 314 GB for the 102 M × 768 LAION file).
++    """
++    n_total, dim_in = xb_lazy.shape
++    print(f"Saving {n_total:,} original vectors (float16) -> {out_path}")
++
++    mm = np.lib.format.open_memmap(
++        out_path, mode='w+', dtype='float16', shape=(n_total, dim_in)
++    )
++    for chunk, start, stop in xb_lazy.iter_chunks():
++        mm[start:stop] = chunk   # chunk is already float16
++        # Write the memory-mapped output to disk every 10 chunks, not only at the end.
++        if ((stop // args.chunk_size) % 10) == 0:
++            mm.flush()
++    mm.flush()
++    del mm
++    print(f"  -> saved  shape=({n_total}, {dim_in})  dtype=float16")
++
++
++def save_chunked_transformed(xb_lazy: LaionLazyLoader, net, out_path: str) -> None:
++    """
++    Runs the network over the lazy-loaded base vectors chunk by chunk and
++    saves the float16 output to a .npy file via memory-mapped writes.
++    """
++    n_total, _ = xb_lazy.shape
++    print(f"Transforming {n_total:,} base vectors in chunks of {args.chunk_size:,} ...")
++    print(f"  output: {out_path}  shape=({n_total}, {dout})  dtype=float16")
++
++    mm = np.lib.format.open_memmap(
++        out_path, mode='w+', dtype='float16', shape=(n_total, dout)
++    )
++    for chunk, start, stop in xb_lazy.iter_chunks():
++        chunk_f32 = chunk.astype('float32')
++        out = forward_pass(net, chunk_f32, bs=1024, device=args.device)
++        mm[start:stop] = out.astype('float16')
++        # Write the memory-mapped output to disk every 10 chunks, not only at the end.
++        if ((stop // args.chunk_size) % 10) == 0:
++            mm.flush()
++    mm.flush()
++    del mm
++    print(f"  -> saved  ({n_total:,} vectors)")
++
++
++# ---------------------------------------------------------------------------
++# Argument parsing
++# ---------------------------------------------------------------------------
++
++parser = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
++parser.add_argument("--ckpt-path",  type=str, required=True,
++                    help="Path to the .pth checkpoint (e.g. checkpoints/bigann64/0.0002/checkpoint.pth.best)")
++parser.add_argument("--database",   type=str, default="bigann",
++                    choices=["bigann", "deep1b", "laion"],
++                    help="Dataset to transform")
++parser.add_argument("--device",     default="auto",
++                    help="Device for inference: cpu, cuda, or auto")
++parser.add_argument("--output-dir", type=str, default=None,
++                    help="Base output directory. Both originals and transformed "
++                         "vectors are written under this path. "
++                         "Default: ./data (relative to cwd). "
++                         "On Metacentrum use absolute path, e.g. "
++                         "/storage/brno2/home/user/data")
++
++# LAION-specific
++parser.add_argument("--size-base",  type=int, default=int(1e8),
++                    help="Number of base vectors to export for laion "
++                         "(default: 100 M). Use 1_000_000 or 10_000_000 for smaller runs.")
++parser.add_argument("--chunk-size", type=int, default=500_000,
++                    help="Vectors per chunk for chunked processing "
++                         "(500 K × 768 × 2 B ≈ 0.77 GB as float16, "
++                         "1.5 GB after the float32 cast for the network)")
++
++args = parser.parse_args()
++
++
++# ---------------------------------------------------------------------------
++# Load checkpoint
++# ---------------------------------------------------------------------------
++if args.device == "auto":
++    args.device = "cuda" if torch.cuda.is_available() else "cpu"
++print(f"  Device: {args.device}")
++
++print(f"Loading checkpoint: {args.ckpt_path}")
++ckpt = torch.load(args.ckpt_path, map_location=args.device, weights_only=False)
++
++# Copy training args that are NOT already set by the CLI (e.g. dint, dout)
++for k, v in vars(ckpt['args']).items():
++    vars(args).setdefault(k, v)
++
++# ---------------------------------------------------------------------------
++# Derive output paths from checkpoint metadata
++# ---------------------------------------------------------------------------
++
++dout = ckpt['args'].dout
++lam = format(Decimal(str(ckpt['args'].lambda_uniform)), "f")
++db = args.database
++
++base_dir = args.output_dir or "data"
++orig_dir = os.path.join(base_dir, db, "original")
++catalyzer_dir = os.path.join(base_dir, db, f"catalyzer_d{dout}_l{lam}")
++
++print(f"  Originals   : {orig_dir}/")
++print(f"  Transformed : {catalyzer_dir}/")
++
++os.makedirs(orig_dir, exist_ok=True)
++os.makedirs(catalyzer_dir, exist_ok=True)
++
++# ---------------------------------------------------------------------------
++# Load dataset
++# ---------------------------------------------------------------------------
++
++load_kwargs = {}
++if args.database == "laion":
++    load_kwargs["chunk_size"] = args.chunk_size
++    size = args.size_base
++else:
++    size = int(1e6)
++
++print(f"Loading {args.database} (size={size:,}) ...")
++xt, xb, xq, gt = load_dataset(args.database, args.device, size=size, test=True, **load_kwargs)
++validate_loaded_dataset(args.database, xb, xq, gt)
++
++dim  = xq.shape[1]
++dint = args.dint
++
++# ---------------------------------------------------------------------------
++# Rebuild network
++# ---------------------------------------------------------------------------
++
++net = nn.Sequential(
++    nn.Linear(in_features=dim, out_features=dint, bias=True),
++    nn.BatchNorm1d(dint),
++    nn.ReLU(),
++    nn.Linear(in_features=dint, out_features=dint, bias=True),
++    nn.BatchNorm1d(dint),
++    nn.ReLU(),
++    nn.Linear(in_features=dint, out_features=dout, bias=True),
++    Normalize()
++)
++
++net.load_state_dict(ckpt['state_dict'])
++net.to(args.device)
++net.eval()
++
++# ---------------------------------------------------------------------------
++# Save original vectors  (shared across all catalyzer variants)
++# ---------------------------------------------------------------------------
++
++xb_orig_path = os.path.join(orig_dir, "xb.npy")
++xq_orig_path = os.path.join(orig_dir, "xq.npy")
++gt_orig_path = os.path.join(orig_dir, "gt.npy")
++xt_orig_path = os.path.join(orig_dir, "xt.npy")
++
++if not os.path.exists(xq_orig_path):
++    np.save(xq_orig_path, xq)
++    print(f"  -> saved xq.npy  shape={xq.shape}")
++else:
++    validate_existing_array(xq_orig_path, xq, "xq.npy")
++    print(f"  xq.npy already exists and matches freshly loaded queries")
++
++if xt is None:
++    print(f"  xt is None, skipping xt.npy")
++elif not os.path.exists(xt_orig_path):
++    np.save(xt_orig_path, xt.astype('float32'))
++    print(f"  -> saved xt.npy  shape={xt.shape}")
++else:
++    existing_xt = np.load(xt_orig_path, mmap_mode='r')
++    if existing_xt.shape != base_shape(xt):
++        raise ValueError(
++            f"Existing xt.npy at {xt_orig_path} has shape {existing_xt.shape}, expected {base_shape(xt)}."
++        )
++    print(f"  xt.npy already exists with expected shape, skipping")
++
++if not os.path.exists(gt_orig_path):
++    np.save(gt_orig_path, gt)
++    print(f"  -> saved gt.npy")
++else:
++    validate_existing_array(gt_orig_path, gt, "gt.npy")
++    print(f"  gt.npy already exists and matches freshly loaded ground truth")
++
++if not os.path.exists(xb_orig_path):
++    if isinstance(xb, LaionLazyLoader):
++        # LAION 100M: stream float16 chunks directly, the full array does not fit in RAM
++        save_chunked_original(xb, xb_orig_path)
++    else:
++        # BigANN and Deep1B fit in RAM. LAION ≤ 10 M is stored as float16 like the 100 M export.
++        dtype_out = 'float16' if args.database == "laion" else 'float32'
++        np.save(xb_orig_path, xb.astype(dtype_out))
++        print(f"  -> saved xb.npy  shape={xb.shape}  dtype={dtype_out}")
++else:
++    existing_xb = np.load(xb_orig_path, mmap_mode='r')
++    expected_shape = base_shape(xb)
++    if existing_xb.shape != expected_shape:
++        raise ValueError(
++            f"Existing xb.npy at {xb_orig_path} has shape {existing_xb.shape}, expected {expected_shape}."
++        )
++    print(f"  xb.npy already exists with expected shape, skipping")
++
++# ---------------------------------------------------------------------------
++# Save transformed vectors  (catalyzer-specific)
++# ---------------------------------------------------------------------------
++
++xqt = forward_pass(net, xq, bs=1024, device=args.device)
++np.save(os.path.join(catalyzer_dir, "xqt.npy"), xqt)
++print(f"  -> saved xqt.npy  shape=({len(xq)}, {dout})")
++
++xbt_path = os.path.join(catalyzer_dir, "xbt.npy")
++
++if isinstance(xb, LaionLazyLoader):
++    save_chunked_transformed(xb, net, xbt_path)
++else:
++    xbt = forward_pass(net, xb, bs=1024, device=args.device)
++    print(f"  avg L2 norm (sanity): {np.linalg.norm(xbt, axis=1).mean():.4f}")
++
++    dtype_out = 'float16' if args.database == "laion" else 'float32'
++    np.save(xbt_path, xbt.astype(dtype_out))
++    print(f"  -> saved xbt.npy  shape={xbt.shape}  dtype={dtype_out}")
++
++print(f"\nDone.")
++print(f"  Transformed : {catalyzer_dir}/")
++print(f"  Originals   : {orig_dir}/")
+diff --git a/lib/data.py b/lib/data.py
+index 654988a..eb82937 100644
+--- a/lib/data.py
++++ b/lib/data.py
+@@ -7,6 +7,8 @@
+ from os.path import join
+ import numpy as np
+ from .metrics import get_nearestneighbors, sanitize
++import os
++import h5py
+ 
+ 
+ def ivecs_read(fname):
+@@ -27,36 +29,89 @@ def mmap_bvecs(fname):
+     return x.reshape(-1, d + 4)[:, 4:]
+ 
+ 
++def mmap_fbin(fname):
++    with open(fname, "rb") as f:
++        _, dim = np.fromfile(f, count=2, dtype=np.int32)
++    file_size = os.path.getsize(fname)
++    actual_n_vecs = (file_size - 8) // (dim * 4)
++    x = np.memmap(fname, dtype='float32', mode='r', offset=8)
++    return x[:actual_n_vecs * dim].reshape(actual_n_vecs, dim).copy()
++
++
++def mmap_ibin(fname):
++    with open(fname, "rb") as f:
++        _, dim = np.fromfile(f, count=2, dtype=np.int32)
++    file_size = os.path.getsize(fname)
++    actual_n_vecs = (file_size - 8) // (dim * 4)
++    x = np.memmap(fname, dtype='int32', mode='r', offset=8)
++    return x[:actual_n_vecs * dim].reshape(actual_n_vecs, dim)
++
+ def getBasedir(s):
++    if "BIGANN_PATH" in os.environ and s == "bigann":
++        return os.environ["BIGANN_PATH"]
++    if "DEEP1B_PATH" in os.environ and s == "deep1b":
++        return os.environ["DEEP1B_PATH"]
++    if "LAION_PATH" in os.environ and s == "laion":
++        return os.environ["LAION_PATH"]
++
+     paths = {
+-        "bigann": "/datasets01/simsearch/041218/bigann",
+-        "deep1b": "/datasets01/simsearch/041218/deep1b"
++        "bigann": "../datasets",
+     }
+ 
+     return paths[s]
+ 
++# Original Deep1B loader of the reference implementation (.fvecs files),
++# kept for reference. load_deep1b below reads the .fbin files used in this
++# thesis and keeps the same train/test split.
++# def load_deep1b(device, size = 10 ** 6, test=True, qsize=10 ** 5):
++#     basedir = getBasedir("deep1b") + '/'
++#     xt = mmap_fvecs(basedir + 'learn.fvecs')
++#     if test:
++#         xb = mmap_fvecs(basedir + 'base.fvecs')
++#         xq = mmap_fvecs(basedir + 'deep1B_queries.fvecs')
++#         xb = xb[:size]
++
++#         gt = ivecs_read(basedir + 'deep%s_groundtruth.ivecs' % (
++#             '1M' if size == 10 ** 6 else
++#             '10M' if size == 10 ** 7 else
++#             '100M' if size == 10 ** 8 else
++#             '1B' if size == 10 ** 9 else 1/0
++#         ))
++#     else:
++#         xb = xt[:size]
++#         xq = xt[size:size+qsize]
++#         xt = xt[size+qsize:]
++
++#     xb, xq = sanitize(xb), sanitize(xq)
++#     if not test:
++#         gt = get_nearestneighbors(xq, xb, 100, device)
++
++#     return xt, xb, xq, gt
+ 
+ def load_deep1b(device, size = 10 ** 6, test=True, qsize=10 ** 5):
+-    basedir = getBasedir("deep1b") + '/'
+-    xt = mmap_fvecs(basedir + 'learn.fvecs')
++    basedir = getBasedir("deep1b")
++
++    xt = mmap_fbin(join(basedir, 'learn.350M.fbin'))
+     if test:
+-        xb = mmap_fvecs(basedir + 'base.fvecs')
+-        xq = mmap_fvecs(basedir + 'deep1B_queries.fvecs')
++        xb = mmap_fbin(join(basedir, 'base.1B.fbin'))
++        xq = mmap_fbin(join(basedir, 'query.public.10K.fbin'))
+         xb = xb[:size]
+ 
+-        gt = ivecs_read(basedir + 'deep%s_groundtruth.ivecs' % (
+-            '1M' if size == 10 ** 6 else
+-            '10M' if size == 10 ** 7 else
+-            '100M' if size == 10 ** 8 else
+-            '1B' if size == 10 ** 9 else 1/0
+-        ))
++        if size == 10 ** 9:
++            gt = mmap_ibin(join(basedir, 'deep_new_groundtruth.public.10K.bin'))
++        else:
++            # The official ground truth covers the full 1B base, so a subset
++            # needs its own, computed below.
++            gt = None
+     else:
+         xb = xt[:size]
+         xq = xt[size:size+qsize]
+         xt = xt[size+qsize:]
++        gt = None
+ 
+     xb, xq = sanitize(xb), sanitize(xq)
+-    if not test:
++    if gt is None:
++        print("Computing groundtruth on the fly for subset...")
+         gt = get_nearestneighbors(xq, xb, 100, device)
+ 
+     return xt, xb, xq, gt
+@@ -85,8 +140,205 @@ def load_bigann(device, size = 10 ** 6, test=True, qsize=10 ** 5):
+     return xt, xb, xq, gt
+ 
+ 
+-def load_dataset(name, device, size=10**6, test=True):
++class LaionLazyLoader:
++    """
++    Chunk-based loader for laion base vectors stored in an HDF5 file.
++
++    The 100 M × 768-D float16 database is too large to materialize fully in RAM.
++    Instead this object exposes an `iter_chunks()` generator that yields
++    ``(chunk_array, start_idx, stop_idx)`` tuples so callers can process
++    the data incrementally and write results directly to a memory-mapped
++    output file.
++
++    The object also exposes `.shape` and `__len__` so that downstream code
++    can query sizes without loading data.
++    """
++
++    def __init__(self, path: str, n_vectors: int, chunk_size: int = 500_000):
++        """
++        Args:
++            path:       Path to the HDF5 file (must contain an 'emb' dataset).
++            n_vectors:  Number of vectors to expose (may be < file length).
++            chunk_size: Vectors per iteration step.  500 K × 768 × 2 B ≈ 0.77 GB
++        """
++        self.path = path
++        self.n_vectors = n_vectors
++        self.chunk_size = chunk_size
++        self._dim: int | None = None
++
++
++    def _get_dim(self) -> int:
++        if self._dim is None:
++            with h5py.File(self.path, 'r') as f:
++                self._dim = int(f['emb'].shape[1])
++        return self._dim
++
++    @property
++    def shape(self) -> tuple[int, int]:
++        return (self.n_vectors, self._get_dim())
++
++    def __len__(self) -> int:
++        return self.n_vectors
++
++    def iter_chunks(self):
++        """
++        Yields ``(chunk, start, stop)`` where:
++          - ``chunk``  is a contiguous float16 ndarray of shape ``(stop-start, dim)``
++          - ``start``  is the inclusive global index of the first vector in the chunk
++          - ``stop``   is the exclusive global end index (one past the last vector)
++        Yields raw float16 — caller casts to float32 for forward_pass if needed
++        """
++        with h5py.File(self.path, 'r') as f:
++            emb = f['emb']
++            for start in range(0, self.n_vectors, self.chunk_size):
++                stop = min(start + self.chunk_size, self.n_vectors)
++                chunk = np.array(emb[start:stop])  # native float16, contiguous copy
++                print(f"  [LaionLazyLoader] processed {stop:,} / {self.n_vectors:,} vectors")
++                yield chunk, start, stop
++
++
++# Maps an upper-bound size to (GT-size-string, HDF5 filename).
++# Sizes above 10 M are served from the 100 M file. Everything up to 10 M
++# is served from the 10 M file, which is fast to read and fits in ~32 GB RAM.
++SISAP24_DB_FILES = {
++      300_000: ("300K", "laion2B-en-clip768v2-n=10M.h5"),
++    1_000_000: ("1M",   "laion2B-en-clip768v2-n=10M.h5"),
++   10_000_000: ("10M",  "laion2B-en-clip768v2-n=10M.h5"),
++  100_000_000: ("100M", "laion2B-en-clip768v2-n=100M.h5"),
++}
++
++QUERIES_FILE = "public-queries-2024-laion2B-en-clip768v2-n=10k.h5"
++GT_FILE_TMPL  = "gold-standard-dbsize={size}--public-queries-2024-laion2B-en-clip768v2-n=10k.h5"
++
++def h5_emb_count(path: str) -> int:
++    with h5py.File(path, 'r') as f:
++        return int(f['emb'].shape[0])
++
++
++def laion_resolve(size: int, basedir: str) -> tuple[str, str, int]:
++    """
++    Given a requested size, return
++    ``(gt_size_str, db_filename, n_vectors)`` for the closest catalogue entry.
++
++    Important: the official SISAP "100M" HDF5 file contains slightly more than
++    100,000,000 rows. The official 100M ground truth is defined against that
++    full file, so this object must expose the actual HDF5 length instead of truncating
++    to exactly 100,000,000.
++    """
++    for threshold, (gt_str, db_file) in sorted(SISAP24_DB_FILES.items()):
++        if size <= threshold:
++            if gt_str == "100M":
++                return gt_str, db_file, h5_emb_count(join(basedir, db_file))
++            return gt_str, db_file, size
++    # Larger than anything in the map -> use the full official 100M file.
++    db_file = "laion2B-en-clip768v2-n=100M.h5"
++    return "100M", db_file, h5_emb_count(join(basedir, db_file))
++
++def load_laion_queries(path: str) -> np.ndarray:
++    """Loads 10k LAION queries fully into RAM """
++    with h5py.File(path, 'r') as f:
++        return f['emb'][:]
++
++def load_laion_ground_truth(path: str, k = 100) -> np.ndarray:
++    """Loads 0-based ground-truth knns[:, :k] from a gold-standard .h5 file."""
++    with h5py.File(path, 'r') as f:
++        gt = f['knns'][:, :k].astype('int64') - 1
++    if gt.min() < 0:
++        raise ValueError(
++            f"LAION ground truth at {path} contains IDs below 1. "
++            "expected official SISAP 1-based IDs."
++        )
++    return gt
++
++def load_laion_database(path: str, n_load = 2_000_000) -> np.ndarray:
++    with h5py.File(path, 'r') as f:
++        return f['emb'][:n_load]
++
++def load_laion(device, size = 10 ** 6, test=True, qsize= 10 ** 5, chunk_size = 500_000):
++    """
++    Load the SISAP 2024 LAION dataset.
++
++    Returns ``(xt, xb, xq, gt)`` — the same tuple contract as
++    ``load_bigann`` / ``load_deep1b``.
++
++    test=True  (eval / export mode)
++    ────────────────────────────────
++    ``xb`` contains (or lazily exposes) all ``size`` base vectors.
++    When size > 10 M, ``xb`` is a :class:`LaionLazyLoader` instead of a
++    plain ndarray — callers that cannot handle this should pass size ≤ 10 M.
++    ``xt`` is a small slice of the base data, and None for the 100 M file.
++
++    test=False  (training mode)
++    ───────────────────────────
++    Unlike BigANN and Deep1B, LAION has no separate learn split, only the
++    base vectors, the public queries and their ground truth. Training
++    therefore splits the first 2 M vectors of the 10 M file, and the 100 M
++    file is not needed.
++    • ``xb``  — first 1 M vectors, the validation base
++    • ``xq``  — next 100 K vectors, the validation queries
++    • ``xt``  — remaining 900 K vectors, of which train.py keeps num_learn (500 K)
++    • ``gt``  — exact ground truth of ``xq`` against ``xb``
++
++    Environment variables
++    ─────────────────────
++    Set ``LAION_PATH`` to the directory that contains the HDF5 files.
++    """
++    basedir = getBasedir("laion")
++
++
++    if test:
++        gt_size_str, db_filename, n_vectors = laion_resolve(int(size), basedir)
++        db_path      = join(basedir, db_filename)
++        queries_path = join(basedir, QUERIES_FILE)
++        gt_path      = join(basedir, GT_FILE_TMPL.format(size=gt_size_str))
++
++        print(f"Loading queries from {queries_path}")
++        xq = load_laion_queries(queries_path)
++        print(f"Loading ground truth from {gt_path}")
++        gt = load_laion_ground_truth(gt_path)
++
++        if n_vectors > 10_000_000:
++            # ── 100 M path: use lazy loader, never load everything at once ──
++            print(f"{n_vectors:,} vectors requested — "
++                  "returning LaionLazyLoader (chunked access)")
++            xb = LaionLazyLoader(db_path, n_vectors, chunk_size=chunk_size)
++            xt = None   # not consumed in export_vectors.py
++        else:
++            # ── ≤ 10 M path: fits in RAM ──
++            print(f"Loading {n_vectors:,} base vectors from {db_path}")
++            xb = load_laion_database(db_path, n_vectors)
++            xt = xb[:min(50_000, n_vectors)]
++
++    else:
++        # ── Training mode ──────────────────────────────────────────────
++        # Training reads only the first 2 M vectors of the 10 M file.
++        train_db_path = join(basedir, "laion2B-en-clip768v2-n=10M.h5")
++        n_load = 2_000_000
++
++        print(f"Training mode — loading {n_load:,} vectors from {train_db_path}")
++        data = load_laion_database(train_db_path, n_load)
++
++        # Define split sizes
++        n_xb = min(size, 1_000_000)
++
++        xb = data[:n_xb]
++        xq = data[n_xb : n_xb + qsize]
++        xt = data[n_xb + qsize :]
++
++    if not isinstance(xb, LaionLazyLoader):
++        xb = sanitize(xb)
++    xq = sanitize(xq)
++
++    if not test:
++        print(f"Computing synthetic ground truth ({qsize} queries vs {n_xb} base) …")
++        gt = get_nearestneighbors(xq, xb, 100, device)
++
++    return xt, xb, xq, gt
++
++def load_dataset(name, device, size=10**6, test=True, **kwargs):
+     if name == "bigann":
+         return load_bigann(device, size, test)
+     elif name == "deep1b":
+         return load_deep1b(device, size, test)
++    elif name == "laion":
++        return load_laion(device, size, test, **kwargs)
+diff --git a/reproduce_metacentrum.sh b/reproduce_metacentrum.sh
+new file mode 100644
+index 0000000..39ea829
+--- /dev/null
++++ b/reproduce_metacentrum.sh
+@@ -0,0 +1,71 @@
++#!/bin/bash
++#PBS -l select=1:ncpus=32:mem=20gb:scratch_ssd=30gb:cluster=halmir
++#PBS -l walltime=1:00:00
++# Usage: qsub reproduce_metacentrum.sh
++
++REPO_DIR="${REPO_DIR:-/storage/brno2/home/martykant/neural-catalyzer-indexing}"
++SCRIPT_DIR="$REPO_DIR/catalyzer"
++BIGANN_DIR="/storage/brno2/home/martykant/datasets/bigann"
++DEEP1B_DIR="/storage/brno2/home/martykant/datasets/deep1b"
++LOG_FILE="$SCRIPT_DIR/reproduce_interactive.log"
++BYTES=1320000000  # first 10 M vectors (132 B each)
++export BIGANN_PATH="$SCRATCHDIR/bigann"
++export DEEP1B_PATH="$SCRATCHDIR/deep"
++
++
++module add mambaforge
++
++
++export OMP_NUM_THREADS=$PBS_NUM_PPN
++export MKL_NUM_THREADS=$PBS_NUM_PPN
++
++echo "======================================"
++echo "Job start: $(date)"
++echo "Host: $(hostname)"
++echo "Threads: $OMP_NUM_THREADS"
++echo "======================================"
++
++mkdir -p $BIGANN_PATH/gnd
++echo "Copying the query and gnd files..."
++cp $BIGANN_DIR/bigann_query.bvecs $BIGANN_PATH/
++cp $BIGANN_DIR/gnd/*.ivecs $BIGANN_PATH/gnd/
++
++echo "Copying bigann_learn.bvecs (10M vectors)..."
++head -c $BYTES $BIGANN_DIR/bigann_learn.bvecs > $BIGANN_PATH/bigann_learn.bvecs
++
++echo "Copying bigann_base.bvecs (10M vectors)..."
++head -c $BYTES $BIGANN_DIR/bigann_base.bvecs > $BIGANN_PATH/bigann_base.bvecs
++
++
++BYTES=3840000008  # 8 B header + first 10 M vectors (384 B each)
++echo "Starting data copy to SCRATCHDIR..."
++
++mkdir -p $DEEP1B_PATH
++COPY_START=$(date +%s)
++
++cp $DEEP1B_DIR/query.public.10K.fbin $DEEP1B_PATH/
++cp $DEEP1B_DIR/deep_new_groundtruth.public.10K.bin $DEEP1B_PATH/
++
++echo "Copying first $BYTES bytes (~10M vectors) from learn and base files..."
++head -c $BYTES $DEEP1B_DIR/learn.350M.fbin > $DEEP1B_PATH/learn.350M.fbin
++head -c $BYTES $DEEP1B_DIR/base.1B.fbin > $DEEP1B_PATH/base.1B.fbin
++
++COPY_END=$(date +%s)
++COPY_TIME=$((COPY_END - COPY_START))
++echo "Data copying finished in $COPY_TIME seconds."
++
++mamba activate /storage/brno2/home/martykant/conda_envs/bc
++
++
++echo "Writing the reproduction output to $LOG_FILE"
++cd $SCRIPT_DIR
++
++bash reproduce.sh 2>&1 | tee -a $LOG_FILE
++
++
++echo "======================================"
++echo "Done: $(date)"
++echo "Log saved to $LOG_FILE"
++echo "======================================"
++
++clean_scratch
+diff --git a/train.py b/train.py
+index c475545..79d70ae 100644
+--- a/train.py
++++ b/train.py
+@@ -178,7 +178,7 @@ if __name__ == '__main__':
+         group.add_argument(*args, **kwargs)
+ 
+     group = parser.add_argument_group('dataset options')
+-    aa("--database", default="deep1b") # can be "bigann", "deep1b" or "*.fvecs"
++    aa("--database", default="deep1b", choices=["bigann", "deep1b", "laion"])
+     aa("--size_base", type=int, default=int(1e6),
+        help="size of evaluation dataset")
+     aa("--num_learn", type=int, default=int(5e5),
+@@ -222,6 +222,8 @@ if __name__ == '__main__':
+     if args.device == "auto":
+         args.device = "cuda" if torch.cuda.is_available() else "cpu"
+ 
++    print("Device:", args.device)
++
+     np.random.seed(args.seed)
+     torch.manual_seed(args.seed)
+ 
+diff --git a/train_scripts/model_train.sh b/train_scripts/model_train.sh
+new file mode 100644
+index 0000000..14c3cb6
+--- /dev/null
++++ b/train_scripts/model_train.sh
+@@ -0,0 +1,67 @@
++#!/bin/bash
++#PBS -l select=1:ncpus=1:ngpus=1:mem=14gb:scratch_ssd=25gb:cluster=galdor
++#PBS -l walltime=02:00:00
++# Usage: qsub -v DOUT=64,LAMBDA=0.0002 train_scripts/model_train.sh
++
++DOUT=${DOUT:-16}
++LAMBDA=${LAMBDA:-0.01}
++
++REPO_DIR="${REPO_DIR:-/storage/brno2/home/martykant/neural-catalyzer-indexing}"
++SCRIPT_DIR="$REPO_DIR/catalyzer"
++BIGANN_DIR="/storage/brno2/home/martykant/datasets/bigann"
++TARGET_DIR="$SCRIPT_DIR/checkpoints/bigann${DOUT}/${LAMBDA}"
++
++mkdir -p "$TARGET_DIR"
++
++BYTES=1320000000  # first 10 M vectors (132 B each)
++export BIGANN_PATH="$SCRATCHDIR"
++
++module add mambaforge
++
++export OMP_NUM_THREADS=$PBS_NUM_PPN
++export MKL_NUM_THREADS=$PBS_NUM_PPN
++
++
++LOG_FILE="$TARGET_DIR/stdout.log"
++exec >> "$LOG_FILE" 2>&1
++
++echo "====================================================="
++echo "Job start: $(date)"
++echo "Host: $(hostname)"
++echo "Threads: $PBS_NUM_PPN, Lambda: $LAMBDA, Dout: $DOUT"
++echo "====================================================="
++
++mkdir -p $SCRATCHDIR/gnd
++echo "Starting data copy to SCRATCHDIR..."
++COPY_START=$(date +%s)
++cp $BIGANN_DIR/bigann_query.bvecs $SCRATCHDIR/
++cp $BIGANN_DIR/gnd/*.ivecs $SCRATCHDIR/gnd/
++head -c $BYTES $BIGANN_DIR/bigann_learn.bvecs > $SCRATCHDIR/bigann_learn.bvecs
++head -c $BYTES $BIGANN_DIR/bigann_base.bvecs > $SCRATCHDIR/bigann_base.bvecs
++COPY_END=$(date +%s)
++COPY_TIME=$((COPY_END - COPY_START))
++echo "Data copying finished in $COPY_TIME seconds."
++
++mamba activate /storage/brno2/home/martykant/conda_envs/bc
++cd $SCRIPT_DIR
++
++
++echo "Start training time: $(date)"
++TRAIN_START=$(date +%s)
++
++/usr/bin/time -v python -u train.py \
++  --dout $DOUT \
++  --save_best_criterion none,rank=10 \
++  --validation_quantizers none \
++  --database bigann \
++  --lambda_uniform $LAMBDA \
++  --checkpoint_dir "$TARGET_DIR"
++
++TRAIN_END=$(date +%s)
++TRAIN_TIME=$((TRAIN_END - TRAIN_START))
++
++echo "End training time: $(date)"
++echo "Training finished in $TRAIN_TIME seconds."
++echo "====================================================="
++
++clean_scratch
+diff --git a/train_scripts/model_train_300.sh b/train_scripts/model_train_300.sh
+new file mode 100644
+index 0000000..4583f0c
+--- /dev/null
++++ b/train_scripts/model_train_300.sh
+@@ -0,0 +1,86 @@
++#!/bin/bash
++#PBS -l select=1:ncpus=1:ngpus=1:mem=14gb:scratch_ssd=25gb:cluster=galdor
++#PBS -l walltime=04:00:00
++# Usage: qsub train_scripts/model_train_300.sh
++
++set -euo pipefail
++
++DOUT=128
++LAMBDA=0.0001
++EPOCHS=300
++# Learning rate of the paper: 0.1, lowered to 0.05 at epoch 80 and to 0.01 at epoch 120.
++# train.py repeats every value EPOCHS / 15 = 20 times.
++LR_SCHEDULE="0.1,0.1,0.1,0.1,0.05,0.05,0.01,0.01,0.01,0.01,0.01,0.01,0.01,0.01,0.01"
++
++REPO_DIR="${REPO_DIR:-/storage/brno2/home/martykant/neural-catalyzer-indexing}"
++SCRIPT_DIR="$REPO_DIR/catalyzer"
++BIGANN_DIR="/storage/brno2/home/martykant/datasets/bigann"
++TARGET_DIR="$SCRIPT_DIR/checkpoints_300/bigann${DOUT}/${LAMBDA}"
++DATA="/storage/brno2/home/martykant/data/bigann/original"
++
++mkdir -p "$TARGET_DIR"
++
++BYTES=1320000000  # first 10 M vectors (132 B each)
++export BIGANN_PATH="$SCRATCHDIR"
++
++module add mambaforge
++
++export OMP_NUM_THREADS=$PBS_NUM_PPN
++export MKL_NUM_THREADS=$PBS_NUM_PPN
++
++
++LOG_FILE="$TARGET_DIR/stdout.log"
++exec >> "$LOG_FILE" 2>&1
++
++echo "====================================================="
++echo "Job start: $(date)"
++echo "Host: $(hostname)"
++echo "Threads: $PBS_NUM_PPN, Lambda: $LAMBDA, Dout: $DOUT"
++echo "====================================================="
++
++mkdir -p $SCRATCHDIR/gnd
++echo "Starting data copy to SCRATCHDIR..."
++COPY_START=$(date +%s)
++cp $BIGANN_DIR/bigann_query.bvecs $SCRATCHDIR/
++cp $BIGANN_DIR/gnd/*.ivecs $SCRATCHDIR/gnd/
++head -c $BYTES $BIGANN_DIR/bigann_learn.bvecs > $SCRATCHDIR/bigann_learn.bvecs
++head -c $BYTES $BIGANN_DIR/bigann_base.bvecs > $SCRATCHDIR/bigann_base.bvecs
++COPY_END=$(date +%s)
++COPY_TIME=$((COPY_END - COPY_START))
++echo "Data copying finished in $COPY_TIME seconds."
++
++mamba activate /storage/brno2/home/martykant/conda_envs/bc
++cd $SCRIPT_DIR
++export PYTHONPATH="$REPO_DIR/catalyzer"
++
++
++echo "Start training time: $(date)"
++TRAIN_START=$(date +%s)
++
++/usr/bin/time -v python -u train.py \
++  --dout $DOUT \
++  --epochs $EPOCHS \
++  --lr_schedule "$LR_SCHEDULE" \
++  --save_best_criterion none,rank=10 \
++  --validation_quantizers none \
++  --database bigann \
++  --lambda_uniform $LAMBDA \
++  --checkpoint_dir "$TARGET_DIR"
++
++TRAIN_END=$(date +%s)
++TRAIN_TIME=$((TRAIN_END - TRAIN_START))
++
++echo "End training time: $(date)"
++echo "Training finished in $TRAIN_TIME seconds."
++echo "====================================================="
++
++/usr/bin/time -v python -u "$REPO_DIR/other-experiments/knn_authors.py" \
++  --ckpt "$TARGET_DIR/checkpoint.pth.best" \
++  --xb "$DATA/xb.npy" \
++  --xq "$DATA/xq.npy" \
++  --gt "$DATA/gt.npy" \
++  --label "thesis_d${DOUT}_l${LAMBDA}_e${EPOCHS}" \
++  --output-dir "$REPO_DIR/results/knn/bigann" \
++  --output-name knn_ceiling_300.csv
++
++clean_scratch
+diff --git a/train_scripts/model_train_deep.sh b/train_scripts/model_train_deep.sh
+new file mode 100644
+index 0000000..22c7841
+--- /dev/null
++++ b/train_scripts/model_train_deep.sh
+@@ -0,0 +1,72 @@
++#!/bin/bash
++#PBS -l select=1:ncpus=1:ngpus=1:mem=24gb:scratch_ssd=25gb:cluster=galdor
++#PBS -l walltime=04:00:00
++# Usage: qsub -v DOUT=64,LAMBDA=0.0002 train_scripts/model_train_deep.sh
++
++DOUT=${DOUT:-16}
++LAMBDA=${LAMBDA:-0.01}
++
++REPO_DIR="${REPO_DIR:-/storage/brno2/home/martykant/neural-catalyzer-indexing}"
++SCRIPT_DIR="$REPO_DIR/catalyzer"
++DEEP1B_DIR="/storage/brno2/home/martykant/datasets/deep1b"
++TARGET_DIR="$SCRIPT_DIR/checkpoints/deep1b${DOUT}/${LAMBDA}"
++
++mkdir -p "$TARGET_DIR"
++
++BYTES=3840000008  # 8 B header + first 10 M vectors (384 B each)
++export DEEP1B_PATH="$SCRATCHDIR"
++
++module add mambaforge
++
++export OMP_NUM_THREADS=$PBS_NUM_PPN
++export MKL_NUM_THREADS=$PBS_NUM_PPN
++
++LOG_FILE="$TARGET_DIR/stdout.log"
++echo "Logging into $LOG_FILE"
++exec >> "$LOG_FILE" 2>&1
++
++
++echo "====================================================="
++echo "Job start: $(date)"
++echo "Host: $(hostname)"
++echo "Threads: $PBS_NUM_PPN, Lambda: $LAMBDA, Dout: $DOUT"
++echo "====================================================="
++
++echo "Starting data copy to SCRATCHDIR..."
++COPY_START=$(date +%s)
++
++cp $DEEP1B_DIR/query.public.10K.fbin $SCRATCHDIR/
++cp $DEEP1B_DIR/deep_new_groundtruth.public.10K.bin $SCRATCHDIR/
++
++echo "Copying first $BYTES bytes (~10M vectors) from learn and base files..."
++head -c $BYTES $DEEP1B_DIR/learn.350M.fbin > $SCRATCHDIR/learn.350M.fbin
++head -c $BYTES $DEEP1B_DIR/base.1B.fbin > $SCRATCHDIR/base.1B.fbin
++
++COPY_END=$(date +%s)
++COPY_TIME=$((COPY_END - COPY_START))
++echo "Data copying finished in $COPY_TIME seconds."
++
++mamba activate /storage/brno2/home/martykant/conda_envs/bc
++cd $SCRIPT_DIR
++
++
++echo "Start training time: $(date)"
++TRAIN_START=$(date +%s)
++
++/usr/bin/time -v python -u train.py \
++  --dout $DOUT \
++  --save_best_criterion none,rank=10 \
++  --validation_quantizers none \
++  --database deep1b \
++  --size_base 1000000 \
++  --lambda_uniform $LAMBDA \
++  --checkpoint_dir "$TARGET_DIR"
++
++TRAIN_END=$(date +%s)
++TRAIN_TIME=$((TRAIN_END - TRAIN_START))
++
++echo "End training time: $(date)"
++echo "Training finished in $TRAIN_TIME seconds."
++echo "====================================================="
++
++clean_scratch
+diff --git a/train_scripts/model_train_laion.sh b/train_scripts/model_train_laion.sh
+new file mode 100644
+index 0000000..97d0c8a
+--- /dev/null
++++ b/train_scripts/model_train_laion.sh
+@@ -0,0 +1,69 @@
++#!/bin/bash
++#PBS -l select=1:ncpus=1:ngpus=1:mem=36gb:scratch_ssd=80gb:cluster=galdor
++#PBS -l walltime=08:00:00
++# Usage: qsub -v DOUT=64,LAMBDA=0.0002 train_scripts/model_train_laion.sh
++
++DOUT=${DOUT:-16}
++LAMBDA=${LAMBDA:-0.01}
++
++REPO_DIR="${REPO_DIR:-/storage/brno2/home/martykant/neural-catalyzer-indexing}"
++SCRIPT_DIR="$REPO_DIR/catalyzer"
++LAION_DIR="/storage/brno2/home/martykant/datasets/laion"
++TARGET_DIR="$SCRIPT_DIR/checkpoints/laion${DOUT}/${LAMBDA}"
++
++mkdir -p "$TARGET_DIR"
++
++export LAION_PATH="$SCRATCHDIR"
++
++module add mambaforge
++
++export OMP_NUM_THREADS=$PBS_NUM_PPN
++export MKL_NUM_THREADS=$PBS_NUM_PPN
++
++
++LOG_FILE="$TARGET_DIR/stdout.log"
++echo "Logging into $LOG_FILE"
++exec >> "$LOG_FILE" 2>&1
++
++
++echo "====================================================="
++echo "Job start: $(date)"
++echo "Host: $(hostname)"
++echo "Threads: $PBS_NUM_PPN, Lambda: $LAMBDA, Dout: $DOUT"
++echo "====================================================="
++
++echo "Starting data copy to SCRATCHDIR..."
++COPY_START=$(date +%s)
++
++cp $LAION_DIR/laion2B-en-clip768v2-n=10M.h5 $SCRATCHDIR/
++cp $LAION_DIR/public-queries-2024-laion2B-en-clip768v2-n=10k.h5 $SCRATCHDIR/
++
++cp $LAION_DIR/gold-standard-dbsize=10M--public-queries-2024-laion2B-en-clip768v2-n=10k.h5 $SCRATCHDIR/
++
++COPY_END=$(date +%s)
++COPY_TIME=$((COPY_END - COPY_START))
++echo "Data copying finished in $COPY_TIME seconds."
++
++mamba activate /storage/brno2/home/martykant/conda_envs/bc
++cd $SCRIPT_DIR
++
++echo "Start training time: $(date)"
++TRAIN_START=$(date +%s)
++
++/usr/bin/time -v python -u train.py \
++  --dout $DOUT \
++  --save_best_criterion none,rank=10 \
++  --validation_quantizers none \
++  --database laion \
++  --size_base 2000000 \
++  --lambda_uniform $LAMBDA \
++  --checkpoint_dir "$TARGET_DIR"
++
++TRAIN_END=$(date +%s)
++TRAIN_TIME=$((TRAIN_END - TRAIN_START))
++
++echo "End training time: $(date)"
++echo "Training finished in $TRAIN_TIME seconds."
++echo "====================================================="
++
++clean_scratch

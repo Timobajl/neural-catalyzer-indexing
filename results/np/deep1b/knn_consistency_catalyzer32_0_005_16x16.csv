@@ -1,0 +1,2 @@
+space,metric,dim,n,n_train,n_bins,eta,k,num_samples,knn_consistency_mean,knn_consistency_std,knn_consistency_p50,knn_consistency_p90,perfect_consistency,zero_consistency,bucket_min,bucket_max,bucket_mean,bucket_std,bucket_imbalance,empty_buckets
+catalyzer32_0_005_16x16,l2,32,1000000,1000000,256,10.0,10,10000,0.5309,0.3228,0.5,1.0,0.1576,0.0623,3416,4684,3906.2,203.9,1.199,0

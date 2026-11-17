@@ -1,0 +1,2 @@
+space,metric,dim,n,height,n_clusters,final_buckets,soft_label_neighbors_effective,k,num_samples,bucket_mean,bucket_std,bucket_min,bucket_max,bucket_imbalance,empty_buckets,knn_consistency_mean,knn_consistency_std,perfect_consistency,zero_consistency
+catalyzer64_0_0002_32x32,l2,64,1000000,2,32,1024,16,10,10000,976.5625,276.32697244953306,23,1731,1.772544,0,0.42366000000000004,0.2755579873638215,0.0544,0.0558

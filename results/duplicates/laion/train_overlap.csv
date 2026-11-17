@@ -1,0 +1,5 @@
+slice,start,stop,rows,rows_in_base,share_in_base
+whole_file,0,10120191,10120191,10120191,1.0
+validation_base,0,1000000,1000000,1000000,1.0
+validation_queries,1000000,1100000,100000,100000,1.0
+training,1100000,1600000,500000,500000,1.0

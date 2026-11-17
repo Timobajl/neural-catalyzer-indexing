@@ -1,0 +1,19 @@
+# Created when the scripts run
+cache/
+catalyzer/checkpoints/
+catalyzer/ckpts/
+example/output/
+indexes/neural-lsh/nlsh_work/
+plots/output/
+results/**/*.log
+results/np/**/models/
+results/np/**/knn_cache/
+results/np/**/bin_assignments/
+
+# PBS job output (<job name>.o<job id>, <job name>.e<job id>)
+*.o[0-9]*
+*.e[0-9]*
+
+# Python
+__pycache__/
+*.pyc

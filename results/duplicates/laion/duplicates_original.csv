@@ -1,0 +1,2 @@
+label,n,dim,distinct_rows,rows_with_a_copy,duplicate_groups,largest_group,largest_group_identical,largest_group_norm,largest_groups
+original,102144212,768,97273072,7070578,2199438,163319,True,0.9994827477848106,163319;24974;23450;20343;17221;14014;8193;7332;7087;6917;5248;4908;4517;4460;4166;3327;3245;3177;3130;3016

@@ -1,0 +1,679 @@
+"""
+LMI benchmark, modified from task1.py of the reference implementation
+(https://github.com/Coda-Research-Group/LearnedMetricIndex/blob/paper-sisap24-indexing-challenge/task1.py).
+
+The changes relative to task1.py are in lmi_index_vs_task1.diff and in the README.
+"""
+
+from __future__ import annotations
+import argparse
+import gc
+import time
+from contextlib import contextmanager
+from concurrent.futures import ThreadPoolExecutor
+from math import ceil, sqrt
+import faiss
+import numpy as np
+import torch
+from torch import Tensor
+from torch.nn import CrossEntropyLoss, Linear, ReLU, Sequential
+from torch.optim import Adam
+from torch.utils.data import DataLoader, Dataset
+import pandas as pd
+import os
+
+SEED = 42
+torch.manual_seed(SEED)
+
+def get_recall(I, gt, k: int) -> float:
+    n = len(I)
+    correct = 0
+    for i in range(n):
+        correct += np.isin(I[i, :k], gt[i, :k]).sum()
+    return round(correct / (n * k), 4)
+
+@contextmanager
+def temporary_thread_counts(num_threads: int):
+    current_torch_threads = torch.get_num_threads()
+    current_faiss_threads = faiss.omp_get_max_threads()
+    torch.set_num_threads(num_threads)
+    faiss.omp_set_num_threads(num_threads)
+    try:
+        yield
+    finally:
+        torch.set_num_threads(current_torch_threads)
+        faiss.omp_set_num_threads(current_faiss_threads)
+
+def metric_name_to_faiss(metric_name: str) -> int:
+    if metric_name == "l2":
+        return faiss.METRIC_L2
+    if metric_name == "ip":
+        return faiss.METRIC_INNER_PRODUCT
+    raise ValueError(f"Unsupported metric: {metric_name}")
+
+def parse_int_list(value: str) -> list[int]:
+    return [int(v.strip()) for v in value.split(",") if v.strip()]
+
+def torch_storage_dtype(np_dtype: np.dtype) -> torch.dtype:
+    return torch.float16 if np.dtype(np_dtype) == np.float16 else torch.float32
+
+def _take_best(D: np.ndarray, I: np.ndarray, k: int, largest: bool) -> tuple[np.ndarray, np.ndarray]:
+    keep_count = min(k, D.shape[1])
+    if largest:
+        keep = np.argpartition(-D, keep_count - 1, axis=1)[:, :keep_count]
+        keep_D = np.take_along_axis(D, keep, axis=1)
+        keep_I = np.take_along_axis(I, keep, axis=1)
+        order = np.argsort(-keep_D, axis=1)
+    else:
+        keep = np.argpartition(D, keep_count - 1, axis=1)[:, :keep_count]
+        keep_D = np.take_along_axis(D, keep, axis=1)
+        keep_I = np.take_along_axis(I, keep, axis=1)
+        order = np.argsort(keep_D, axis=1)
+    return np.take_along_axis(keep_D, order, axis=1), np.take_along_axis(keep_I, order, axis=1)
+
+def exact_knn_chunked(
+    xb_mmap: np.ndarray,
+    query_vectors: np.ndarray,
+    query_ids: np.ndarray,
+    k: int,
+    chunk_size: int,
+    metric_name: str,
+) -> np.ndarray:
+    n = xb_mmap.shape[0]
+    n_queries = query_vectors.shape[0]
+    keep_k = min(k + 1, n)
+    largest = metric_name == "ip"
+    fill = float("-inf") if largest else float("inf")
+    best_D = np.full((n_queries, keep_k), fill, dtype=np.float32)
+    best_I = np.full((n_queries, keep_k), -1, dtype=np.int64)
+    metric = metric_name_to_faiss(metric_name)
+
+    print(f"  [knn-consistency] Exact search by chunks (k={k}, chunk_size={chunk_size:,})...")
+    t0 = time.time()
+    for chunk_idx, start in enumerate(range(0, n, chunk_size), 1):
+        stop = min(start + chunk_size, n)
+        chunk = xb_mmap[start:stop].astype("float32")
+        search_k = min(keep_k, stop - start)
+        D_chunk, I_chunk = faiss.knn(query_vectors, chunk, search_k, metric=metric)
+        I_chunk = I_chunk.astype(np.int64) + start
+
+        merged_D = np.concatenate([best_D, D_chunk], axis=1)
+        merged_I = np.concatenate([best_I, I_chunk], axis=1)
+        best_D, best_I = _take_best(merged_D, merged_I, keep_k, largest)
+
+        elapsed = time.time() - t0
+        speed = stop / max(elapsed, 1e-6)
+        eta = (n - stop) / max(speed, 1e-6)
+        print(
+            f"  [knn-consistency] chunk {chunk_idx} | {stop:,}/{n:,}"
+            f" | elapsed {elapsed:.0f}s | ETA {eta:.0f}s",
+            end="\r",
+        )
+        del chunk
+    print(f"\n  [knn-consistency] Exact search done in {time.time() - t0:.1f}s")
+
+    true_neighbors = np.full((n_queries, k), -1, dtype=np.int64)
+    for row_idx, self_id in enumerate(query_ids):
+        row = best_I[row_idx]
+        row = row[(row >= 0) & (row != self_id)]
+        true_neighbors[row_idx, : min(k, len(row))] = row[:k]
+    return true_neighbors
+
+def load_consistency_cache(
+    path: str, metric_name: str, num_samples: int, k: int
+) -> tuple[np.ndarray, np.ndarray]:
+    """Load (sample_indices, true_neighbors) from a precomputed cache and
+    validate metric/num_samples/k/seed against the current run.
+    """
+    cache = np.load(path)
+    cached_metric = str(cache["metric"])
+    cached_num_samples = int(cache["num_samples"])
+    cached_k = int(cache["k"])
+    cached_seed = int(cache["seed"])
+    if cached_metric != metric_name:
+        raise ValueError(
+            f"Cache metric {cached_metric!r} != --metric {metric_name!r}"
+        )
+    if cached_num_samples != num_samples:
+        raise ValueError(
+            f"Cache num_samples {cached_num_samples} != --consistency-samples {num_samples}"
+        )
+    if cached_k != k:
+        raise ValueError(f"Cache k {cached_k} != --consistency-k {k}")
+    if cached_seed != SEED:
+        raise ValueError(f"Cache seed {cached_seed} != --seed {SEED}")
+    return cache["sample_indices"], cache["true_neighbors"]
+
+
+def compute_lmi_knn_consistency(
+    lmi: "LMI",
+    xb_mmap: np.ndarray,
+    k: int,
+    num_samples: int,
+    chunk_size: int,
+    xb_orig: np.ndarray = None,
+    cache_path: str = None,
+) -> dict:
+    if lmi.bucket_assignments is None:
+        raise ValueError("LMI bucket assignments are not available for kNN consistency.")
+
+    n = xb_mmap.shape[0]
+
+    if cache_path is not None:
+        print(f"\n  [knn-consistency] loading cache from {cache_path}")
+        sample_indices, true_neighbors = load_consistency_cache(
+            cache_path, lmi.metric_type, num_samples, k
+        )
+        num_samples = len(sample_indices)
+        print(f"  [knn-consistency] cache loaded (samples={num_samples:,}, k={k})")
+    else:
+        knn_source = xb_orig if xb_orig is not None else xb_mmap
+        if knn_source.shape[0] != n:
+            raise ValueError(
+                f"xb_orig must have the same n as xb_mmap (got {knn_source.shape[0]} vs {n})."
+            )
+        num_samples = min(num_samples, n)
+        knn_space = "original" if xb_orig is not None else "self"
+        print(f"\n  [knn-consistency] samples={num_samples:,} k={k}  knn_space={knn_space}")
+
+        rng = np.random.default_rng(SEED)
+        sample_indices = rng.choice(n, size=num_samples, replace=False).astype(np.int64)
+        xb_sample = knn_source[sample_indices].astype("float32")
+        true_neighbors = exact_knn_chunked(
+            xb_mmap=knn_source,
+            query_vectors=xb_sample,
+            query_ids=sample_indices,
+            k=k,
+            chunk_size=chunk_size,
+            metric_name=lmi.metric_type,
+        )
+
+    assignments = lmi.bucket_assignments.numpy()
+    sample_buckets = assignments[sample_indices]
+    valid_neighbors = true_neighbors >= 0
+    neighbor_buckets = np.full(true_neighbors.shape, -1, dtype=assignments.dtype)
+    neighbor_buckets[valid_neighbors] = assignments[true_neighbors[valid_neighbors]]
+    matches = (neighbor_buckets == sample_buckets[:, None]) & valid_neighbors
+    per_sample = matches.sum(axis=1) / np.maximum(valid_neighbors.sum(axis=1), 1)
+
+    bucket_sizes = np.bincount(assignments, minlength=lmi.n_buckets).astype(np.float64)
+    stats = {
+        "knn_consistency_mean": float(np.mean(per_sample)),
+        "knn_consistency_std": float(np.std(per_sample)),
+        "perfect_consistency": float(np.mean(per_sample == 1.0)),
+        "zero_consistency": float(np.mean(per_sample == 0.0)),
+        "bucket_mean": float(np.mean(bucket_sizes)),
+        "bucket_std": float(np.std(bucket_sizes)),
+        "bucket_min": int(np.min(bucket_sizes)),
+        "bucket_max": int(np.max(bucket_sizes)),
+        "bucket_imbalance": float(np.max(bucket_sizes) / (n / lmi.n_buckets)),
+        "empty_buckets": int(np.sum(bucket_sizes == 0)),
+    }
+    print(
+        f"  [knn-consistency] {stats['knn_consistency_mean']:.4f}"
+        f" +/- {stats['knn_consistency_std']:.4f}"
+        f"  (perfect={stats['perfect_consistency']:.3f}, zero={stats['zero_consistency']:.3f})"
+    )
+    return stats
+
+class LMIDataset(Dataset):
+    def __init__(self, X: Tensor, y: Tensor):
+        self.X = X
+        self.y = y
+
+    def __len__(self) -> int:
+        return self.X.shape[0]
+
+    def __getitem__(self, index: int) -> tuple[Tensor, Tensor]:
+        return self.X[index], self.y[index]
+
+class LMI:
+    def __init__(
+        self,
+        n_buckets: int,
+        data_dimensionality: int,
+        model: Sequential,
+        metric_type: str,
+        storage_dtype: torch.dtype,
+        workers: int,
+        inner_threads: int,
+    ):
+        self.n_buckets: int = n_buckets
+        self.dimensionality: int = data_dimensionality
+        self.model = model
+        self.metric_type = metric_type
+        self.storage_dtype = storage_dtype
+        self.workers = workers
+        self.inner_threads = inner_threads
+        self.bucket_data: dict[int, Tensor] = {}
+        """Mapping from bucket ID to the data in the bucket."""
+        self.bucket_data_ids: dict[int, Tensor] = {}
+        """Mapping from bucket ID to the indices of the data in the bucket."""
+        self.bucket_assignments: Tensor | None = None
+
+    @staticmethod
+    def _train_model(model: Sequential, X: Tensor, y: Tensor, epochs: int, lr: float) -> None:
+        train_loader = DataLoader(dataset=LMIDataset(X, y), batch_size=256, shuffle=True)
+        loss_fn = CrossEntropyLoss()
+        optimizer = Adam(params=model.parameters(), lr=lr)
+
+        model.train()
+        print(f"Training LMI network (epochs={epochs}, lr={lr})...")
+        for epoch in range(epochs):
+            for X_batch, y_batch in train_loader:
+                loss = loss_fn(model(X_batch.to(torch.float32)), y_batch)
+                loss.backward()
+                optimizer.step()
+                optimizer.zero_grad()
+            if epoch % 5 == 0 or epoch == epochs - 1:
+                print(f"Epoch {epoch} | Loss {loss.item():.4f}")
+
+    def _visit_bucket(self, bucket: int, query: Tensor, k: int) -> tuple[Tensor, Tensor, int]:
+        if len(self.bucket_data[bucket]) == 0:
+            val = float('inf') if self.metric_type == 'l2' else float('-inf')
+            return torch.full((k,), val, dtype=torch.float32), torch.full((k,), -1), 0
+
+        bucket_data = self.bucket_data[bucket].to(torch.float32)
+        dist_comps = len(bucket_data)
+        metric = faiss.METRIC_L2 if self.metric_type == 'l2' else faiss.METRIC_INNER_PRODUCT
+        search_k = min(k, dist_comps)
+        D, I = faiss.knn(query, bucket_data, search_k, metric=metric)
+        del bucket_data
+
+        if search_k < k:
+            val = float('inf') if self.metric_type == 'l2' else float('-inf')
+            full_D = torch.full((k,), val, dtype=torch.float32)
+            full_I = torch.full((k,), -1, dtype=torch.int64)
+            full_D[:search_k] = torch.from_numpy(D[0])
+            full_I[:search_k] = self.bucket_data_ids[bucket][I[0]]
+            return full_D, full_I, dist_comps
+        else:
+            return torch.from_numpy(D[0]), self.bucket_data_ids[bucket][I[0]], dist_comps
+
+    def _visit_buckets(self, k: int, predicted_buckets: Tensor, query: Tensor, query_idx: int, nprobe: int) -> tuple[Tensor, Tensor, int, int]:
+        Is = torch.empty((k * nprobe,), dtype=torch.int64)
+        Ds = torch.empty((k * nprobe,), dtype=torch.float32)
+        total_dist_comps = 0
+
+        for nth_bucket in range(nprobe):
+            D, I, comps = self._visit_bucket(int(predicted_buckets[nth_bucket].item()), query, k)
+            total_dist_comps += comps
+
+            start, stop = nth_bucket * k, (nth_bucket + 1) * k
+            Ds[start:stop], Is[start:stop] = D, I
+
+        largest = (self.metric_type == 'ip')
+        dists, indices_to_keep = torch.topk(Ds, k, largest=largest)
+
+        return dists, Is[indices_to_keep], query_idx, total_dist_comps
+
+    def search(self, queries: Tensor, k: int, nprobe: int = 100) -> tuple[np.ndarray, np.ndarray, float, float, float]:
+        t0_inf = time.time()
+        predicted_bucket_ids = self._predict(queries, nprobe)
+        inference_time = time.time() - t0_inf
+
+        n_queries = queries.shape[0]
+        D = np.empty((n_queries, k), dtype=np.float32)
+        I = np.empty((n_queries, k), dtype=np.int64)
+        total_computations = 0
+        t0_search = time.time()
+
+        with temporary_thread_counts(self.inner_threads):
+            with ThreadPoolExecutor(max_workers=self.workers) as executor:
+                results = executor.map(
+                    lambda i: self._visit_buckets(k, predicted_bucket_ids[i], queries[i : i + 1], i, nprobe),
+                    range(n_queries),
+                )
+                for dists, nns, query_id, comps in results:
+                    D[query_id, :] = dists.numpy()
+                    I[query_id, :] = nns.numpy()
+                    total_computations += comps
+
+        search_time = time.time() - t0_search
+        avg_dist_comps = total_computations / n_queries
+        return D, I, avg_dist_comps, inference_time, search_time
+
+    def _predict(self, X: Tensor, top_k: int) -> Tensor:
+        self.model.eval()
+        with torch.no_grad():
+            logits = self.model(X)
+        return logits.topk(top_k)[1]
+
+    def _bucket_init(self, classes: Tensor, bucket: int) -> None:
+        indices = torch.where(classes == bucket)[0]
+        self.bucket_data_ids[bucket] = indices
+        self.bucket_data[bucket] = torch.empty((len(indices), self.dimensionality), dtype=self.storage_dtype)
+
+    def _sort_data(self, data: Tensor, classes: Tensor, bucket: int, start: int, stop: int) -> None:
+        self.bucket_data[bucket][start:stop] = data[classes == bucket]
+
+    def _label_data(self, dataset_mmap: np.ndarray, chunk_i: int, chunk_size: int) -> tuple[Tensor, int, int]:
+        start = chunk_i * chunk_size
+        stop = min((chunk_i + 1) * chunk_size, dataset_mmap.shape[0])
+        chunk = torch.from_numpy(dataset_mmap[start:stop].astype("float32"))
+        predicted_bucket_ids = self._predict(chunk, 1).reshape(-1)
+        del chunk
+        return predicted_bucket_ids, start, stop
+
+    def _chunk_sort(self, dataset_mmap: np.ndarray, classes: Tensor, chunk_i: int, offsets: dict, chunk_size: int) -> None:
+        start = chunk_i * chunk_size
+        stop = min((chunk_i + 1) * chunk_size, dataset_mmap.shape[0])
+        classes_chunk = classes[start:stop]
+        chunk = torch.from_numpy(dataset_mmap[start:stop].astype("float32"))
+        with temporary_thread_counts(self.inner_threads):
+            with ThreadPoolExecutor(max_workers=self.workers) as executor:
+                executor.map(
+                    lambda x: self._sort_data(
+                        chunk,
+                        classes_chunk,
+                        x,
+                        offsets[x][chunk_i],
+                        offsets[x][chunk_i + 1],
+                    ),
+                    range(self.n_buckets),
+                )
+        del chunk
+
+    def _create_offsets(self, classes: Tensor, n_chunks: int, chunk_size: int) -> dict:
+        offsets = {i: {0: 0} for i in range(self.n_buckets)}
+        for chunk_i in range(n_chunks):
+            start = chunk_i * chunk_size
+            stop = min((chunk_i + 1) * chunk_size, len(classes))
+            counts = torch.bincount(classes[start:stop], minlength=self.n_buckets)
+            for i in range(self.n_buckets):
+                offsets[i][chunk_i + 1] = offsets[i][chunk_i] + int(counts[i])
+        return offsets
+
+    def _create_buckets(
+        self, dataset_mmap: np.ndarray, n_data: int, chunk_size: int,
+        assignments_only: bool = False,
+    ) -> None:
+        print('Assigning vectors and building LMI buckets in chunks...')
+        n_chunks = ceil(n_data / chunk_size)
+        classes = torch.empty((n_data,), dtype=torch.int32)
+
+        for i in range(n_chunks):
+            result = self._label_data(dataset_mmap, i, chunk_size)
+            classes[result[1] : result[2]] = result[0]
+        gc.collect()
+
+        self.bucket_assignments = classes
+        if assignments_only:
+            return
+
+        offsets = self._create_offsets(classes, n_chunks, chunk_size)
+
+        with temporary_thread_counts(self.inner_threads):
+            with ThreadPoolExecutor(max_workers=self.workers) as executor:
+                executor.map(lambda x: self._bucket_init(classes, x), range(self.n_buckets))
+
+        for i in range(n_chunks):
+            self._chunk_sort(dataset_mmap, classes, i, offsets, chunk_size)
+        bucket_sizes = [len(self.bucket_data[i]) for i in range(self.n_buckets)]
+        print(
+            f"  Bucket sizes: min={min(bucket_sizes)} max={max(bucket_sizes)}"
+            f" mean={sum(bucket_sizes)/len(bucket_sizes):.1f} std={np.std(bucket_sizes):.1f}"
+        )
+        gc.collect()
+
+    @staticmethod
+    def _run_kmeans(n_buckets: int, data_dim: int, X_train: Tensor, metric_type: str) -> Tensor:
+        spherical = (metric_type == 'ip')
+        print(f"  K-Means initialization (spherical={spherical})...")
+        kmeans = faiss.Kmeans(
+            d=data_dim,
+            k=n_buckets,
+            verbose=False,
+            seed=SEED,
+            spherical=spherical,
+        )
+        kmeans.train(X_train)
+        return torch.from_numpy(kmeans.index.search(X_train, 1)[1].T[0])
+
+    @staticmethod
+    def create(
+        dataset_mmap: np.ndarray,
+        epochs: int,
+        lr: float,
+        sample_size: int,
+        n_buckets: int,
+        chunk_size: int,
+        metric_type: str,
+        workers: int,
+        inner_threads: int,
+        model_path: str = None,
+        assignments_only: bool = False,
+    ) -> LMI:
+
+        n_data, data_dim = dataset_mmap.shape
+        storage_dtype = torch_storage_dtype(dataset_mmap.dtype)
+        print(f"  Bucket storage dtype: {storage_dtype}")
+        nn_model = Sequential(
+            Linear(data_dim, 512),
+            ReLU(),
+            Linear(512, n_buckets),
+        )
+
+        if model_path and os.path.exists(model_path):
+            print(f"  Loading saved model from {model_path}...")
+            nn_model.load_state_dict(torch.load(model_path, weights_only=True))
+            nn_model.eval()
+        else:
+            print("  Loading random training sample into RAM...")
+            sample_indices = np.sort(np.random.choice(n_data, sample_size, replace=False))
+            X_train = torch.from_numpy(dataset_mmap[sample_indices].astype("float32"))
+
+            y = LMI._run_kmeans(n_buckets, data_dim, X_train, metric_type)
+
+            LMI._train_model(nn_model, X_train, y, epochs, lr)
+            if model_path:
+                os.makedirs(os.path.dirname(model_path) or ".", exist_ok=True)
+                torch.save(nn_model.state_dict(), model_path)
+                print(f"  Model saved to {model_path}")
+
+            del X_train
+            gc.collect()
+
+        lmi = LMI(n_buckets, data_dim, nn_model, metric_type, storage_dtype, workers, inner_threads)
+        lmi._create_buckets(dataset_mmap, n_data, chunk_size, assignments_only=assignments_only)
+        return lmi
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description="LMI benchmark.")
+    parser.add_argument("--xb", required=True)
+    parser.add_argument(
+        "--xb-orig", default=None,
+        help="Original-space vectors. Used by kNN consistency on transformed-space runs.",
+    )
+    parser.add_argument("--xq", required=True)
+    parser.add_argument("--gt", required=True)
+    parser.add_argument("--label", required=True)
+    parser.add_argument("--output-dir", default="lmi_results")
+    parser.add_argument("--model-dir", default="")
+    parser.add_argument('--epochs', type=int, default=15)
+    parser.add_argument('--lr', type=float, default=0.00098)
+    parser.add_argument('--sample-size', type=int, default=1_000_000)
+    parser.add_argument('--chunk-size', type=int, default=500_000)
+    parser.add_argument(
+        '--n-buckets-values',
+        type=str,
+        default="",
+        help="Comma-separated bucket counts. Default: sqrt(n), 2*sqrt(n), 4*sqrt(n).",
+    )
+    parser.add_argument('--nprobe-values', type=str, default="1,2,4,8,16,32,64,128")
+    parser.add_argument('--threads', type=int, default=32)
+    parser.add_argument('--workers', type=int, default=8)
+    parser.add_argument('--inner-threads', type=int, default=4)
+    parser.add_argument('--seed', type=int, default=42)
+    parser.add_argument('--consistency-samples', type=int, default=10_000)
+    parser.add_argument('--consistency-k', type=int, default=10)
+    parser.add_argument('--skip-consistency', action='store_true')
+    parser.add_argument(
+        '--consistency-only', action='store_true',
+        help="Compute kNN consistency and skip the nprobe sweep.",
+    )
+    parser.add_argument(
+        '--consistency-cache', default=None,
+        help="Path to precomputed kNN-consistency cache (.npz from "
+             "compute_true_neighbors.py). When set, skips inline kNN.",
+    )
+    parser.add_argument('--metric', type=str, required=True, choices=['l2', 'ip'])
+    args = parser.parse_args()
+
+    if args.threads < 1:
+        parser.error("--threads must be >= 1")
+    if args.workers < 1:
+        parser.error("--workers must be >= 1")
+    if args.inner_threads < 1:
+        parser.error("--inner-threads must be >= 1")
+    if args.chunk_size < 1:
+        parser.error("--chunk-size must be >= 1")
+    if args.consistency_samples < 1:
+        parser.error("--consistency-samples must be >= 1")
+    if args.consistency_k < 1:
+        parser.error("--consistency-k must be >= 1")
+
+    SEED = args.seed
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
+    torch.set_num_threads(args.threads)
+    faiss.omp_set_num_threads(args.threads)
+
+    print(f"\n[{args.label}] Loading data with mmap...")
+    xb_mmap = np.load(args.xb, mmap_mode='r')
+    xq = np.load(args.xq).astype("float32")
+    xq_tensor = torch.from_numpy(xq)
+    gt = np.load(args.gt)
+    xb_orig_mmap = np.load(args.xb_orig, mmap_mode='r') if args.xb_orig else None
+    if xb_orig_mmap is not None:
+        if xb_orig_mmap.shape[0] != xb_mmap.shape[0]:
+            parser.error(
+                f"--xb-orig row count {xb_orig_mmap.shape[0]:,} does not match "
+                f"--xb row count {xb_mmap.shape[0]:,}; row IDs must align."
+            )
+        print(f"  xb_orig: {xb_orig_mmap.shape[0]:,} x {xb_orig_mmap.shape[1]} dtype={xb_orig_mmap.dtype}")
+
+    n_data, d = xb_mmap.shape
+    if xq.shape[1] != d:
+        parser.error(f"xq dimensionality {xq.shape[1]} does not match xb dimensionality {d}")
+    if gt.shape[1] < 30:
+        parser.error(f"gt must contain at least 30 neighbors per query, got shape {gt.shape}")
+    if args.sample_size > n_data:
+        parser.error(f"--sample-size {args.sample_size} is larger than xb size {n_data}")
+
+    print(f"  xb: {n_data:,} x {d} dtype={xb_mmap.dtype}")
+    print(f"  xq: {xq.shape[0]:,} x {xq.shape[1]}")
+    print(f"  gt: {gt.shape}")
+    print(f"  metric: {args.metric} (FAISS metric_type={metric_name_to_faiss(args.metric)})")
+    print(
+        f"  threads={args.threads} workers={args.workers}"
+        f" inner_threads={args.inner_threads}"
+        f" parallel_budget={args.workers * args.inner_threads}"
+    )
+
+    if args.n_buckets_values:
+        n_buckets_values = parse_int_list(args.n_buckets_values)
+    else:
+        bucket_size = int(sqrt(n_data))
+        n_buckets_values = [bucket_size, bucket_size * 2, bucket_size * 4]
+        print(f"  Auto n_buckets values: {n_buckets_values} (sqrt of {n_data:,})")
+    nprobe_values = parse_int_list(args.nprobe_values)
+    if not n_buckets_values or any(v < 1 for v in n_buckets_values):
+        parser.error("--n-buckets-values must contain positive integers")
+    if not nprobe_values or any(v < 1 for v in nprobe_values):
+        parser.error("--nprobe-values must contain positive integers")
+
+    os.makedirs(args.output_dir, exist_ok=True)
+    if args.model_dir:
+        os.makedirs(args.model_dir, exist_ok=True)
+    results = []
+    consistency_results = []
+    out_path = os.path.join(args.output_dir, f"lmi_results_{args.label}.csv")
+    cons_path = os.path.join(args.output_dir, f"knn_consistency_{args.label}.csv")
+
+    for n_buckets in n_buckets_values:
+        print(f"\n--- Building LMI index for n_buckets={n_buckets} (dim={d}) ---")
+
+        model_filename = None
+        if args.model_dir:
+            model_filename = os.path.join(args.model_dir, f"lmi_model_{args.label}_{n_buckets}buckets.pth")
+        start = time.time()
+        lmi = LMI.create(
+            xb_mmap,
+            args.epochs,
+            args.lr,
+            args.sample_size,
+            n_buckets,
+            args.chunk_size,
+            args.metric,
+            args.workers,
+            args.inner_threads,
+            model_filename,
+            assignments_only=args.consistency_only,
+        )
+        total_build_time = time.time() - start
+        print(f"  Index built in: {total_build_time:.2f}s")
+
+        if not args.skip_consistency:
+            stats = compute_lmi_knn_consistency(
+                lmi=lmi,
+                xb_mmap=xb_mmap,
+                k=args.consistency_k,
+                num_samples=args.consistency_samples,
+                chunk_size=args.chunk_size,
+                xb_orig=xb_orig_mmap,
+                cache_path=args.consistency_cache,
+            )
+            consistency_results.append({
+                "space": args.label,
+                "metric": args.metric,
+                "dim": d,
+                "n": n_data,
+                "n_buckets": n_buckets,
+                "k": args.consistency_k,
+                "num_samples": min(args.consistency_samples, n_data),
+                **stats,
+            })
+            pd.DataFrame(consistency_results).to_csv(cons_path, index=False)
+            print(f"  Consistency flushed to {cons_path}")
+
+        if args.consistency_only:
+            continue
+
+        for nprobe in nprobe_values:
+            if nprobe > n_buckets:
+                print(f"  Skipping nprobe={nprobe} (> n_buckets={n_buckets})")
+                continue
+
+            D, I, avg_dist_comp, inference_time, search_time = lmi.search(xq_tensor, k=30, nprobe=nprobe)
+            recall1 = get_recall(I, gt, 1)
+            recall5 = get_recall(I, gt, 5)
+            recall10 = get_recall(I, gt, 10)
+            recall30 = get_recall(I, gt, 30)
+            results.append({
+                "space": args.label,
+                "metric": args.metric,
+                "dim": d,
+                "n": n_data,
+                "n_buckets": n_buckets,
+                "nprobe": nprobe,
+                "recall@1": recall1,
+                "recall@5": recall5,
+                "recall@10": recall10,
+                "recall@30": recall30,
+                "train_time": total_build_time,
+                "inference_time": inference_time,
+                "search_time": search_time,
+                "total_time": inference_time + search_time,
+                "dist_computations": avg_dist_comp,
+                "bucket_storage_dtype": str(lmi.storage_dtype).replace("torch.", ""),
+            })
+            print(
+                f"  nprobe={nprobe:3} | R@1={recall1:.4f} R@10={recall10:.4f} R@30={recall30:.4f}"
+                f" | DistComps={avg_dist_comp:.1f} | Time={inference_time + search_time:.4f}s"
+            )
+
+        pd.DataFrame(results).to_csv(out_path, index=False)
+        print(f"  Results flushed to {out_path}")
+
+    print("\nDone.")

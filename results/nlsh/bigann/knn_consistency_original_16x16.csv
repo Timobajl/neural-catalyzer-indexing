@@ -1,0 +1,2 @@
+space,metric,dim,n,height,n_clusters,final_buckets,soft_label_neighbors_effective,k,num_samples,bucket_mean,bucket_std,bucket_min,bucket_max,bucket_imbalance,empty_buckets,knn_consistency_mean,knn_consistency_std,perfect_consistency,zero_consistency
+original_16x16,l2,128,1000000,2,16,256,16,10,10000,3906.25,854.8909012996921,921,5599,1.433344,0,0.53527,0.27689533600261307,0.1046,0.0199
